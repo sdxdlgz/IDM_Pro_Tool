@@ -131,6 +131,9 @@ cd IDM_Pro_Tool
 # 执行模式一：极速底层解锁
 IDM_Pro_Tool.exe -patch
 
+# 执行模式二：永久冻结试用期（Windows ACL 锁定时间戳与 CLSID）
+IDM_Pro_Tool.exe -freeze
+
 # 执行模式三：自定义身份登记
 IDM_Pro_Tool.exe -register "VIP_User" "vip@domain.com"
 

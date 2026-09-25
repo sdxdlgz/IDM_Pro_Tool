@@ -12,7 +12,9 @@ using System.Windows.Media.Imaging;
 using System.Windows.Interop;
 using System.Windows.Media.Effects;
 using System.Windows.Media.Animation;
+using System.Security;
 using System.Security.Principal;
+using System.Security.AccessControl;
 using Microsoft.Win32;
 using Microsoft.Win32.SafeHandles;
 
@@ -80,6 +82,7 @@ namespace IDM_Toolkit_Wpf
             {
                 string firstArg = args[0].ToLowerInvariant();
                 if (firstArg == "-patch" || firstArg == "/patch" ||
+                    firstArg == "-freeze" || firstArg == "/freeze" ||
                     firstArg == "-register" || firstArg == "/register" ||
                     firstArg == "-restore" || firstArg == "/restore" ||
                     firstArg == "-setpath" || firstArg == "/setpath" ||
@@ -95,6 +98,7 @@ namespace IDM_Toolkit_Wpf
                     {
                         Console.WriteLine("支持命令行选项：");
                         Console.WriteLine("  -patch                执行模式一：底层深度解锁（18处校验点修补与签名剥离）");
+                        Console.WriteLine("  -freeze               执行模式二：永久冻结试用期（Windows ACL 锁定时间戳与 CLSID）");
                         Console.WriteLine("  -register [name] [email] [serial]  执行模式三：个性化登记并联动解锁");
                         Console.WriteLine("  -restore              执行一键还原官方原版主程序与官方未注册配置");
                         Console.WriteLine("  -setpath <dir/exe>    手动设定并持久化 IDM 安装目录或 IDMan.exe 绝对路径");
@@ -124,6 +128,14 @@ namespace IDM_Toolkit_Wpf
                         int count = 0;
                         bool ok = MainWindow.ExecutePatchDirect(Console.WriteLine, out count);
                         Console.WriteLine("Patch finished: ok=" + ok + ", count=" + count);
+                        return;
+                    }
+
+                    if (firstArg == "-freeze" || firstArg == "/freeze")
+                    {
+                        int count = 0;
+                        bool ok = MainWindow.ExecuteTrialFreezeDirect(Console.WriteLine, out count);
+                        Console.WriteLine("Freeze finished: ok=" + ok + ", count=" + count);
                         return;
                     }
 
@@ -2166,6 +2178,7 @@ namespace IDM_Toolkit_Wpf
             {
                 using (RegistryKey k = Registry.CurrentUser.OpenSubKey(@"Software\DownloadManager"))
                 {
+                    bool isFrozen = TrialFreezeEngine.IsTrialFrozen();
                     if (k != null)
                     {
                         object fname = k.GetValue("FName");
@@ -2174,11 +2187,21 @@ namespace IDM_Toolkit_Wpf
                             lblStatAuth.Text = "已登记 (" + fname.ToString().Trim() + ")";
                             lblStatAuth.Foreground = new SolidColorBrush(ColBlue);
                         }
+                        else if (isFrozen)
+                        {
+                            lblStatAuth.Text = "❄️ 试用已永久冻结 (30天)";
+                            lblStatAuth.Foreground = new SolidColorBrush(Color.FromRgb(56, 189, 248));
+                        }
                         else
                         {
                             lblStatAuth.Text = "未登记";
                             lblStatAuth.Foreground = new SolidColorBrush(ColAmber);
                         }
+                    }
+                    else if (isFrozen)
+                    {
+                        lblStatAuth.Text = "❄️ 试用已永久冻结 (30天)";
+                        lblStatAuth.Foreground = new SolidColorBrush(Color.FromRgb(56, 189, 248));
                     }
                     else
                     {
@@ -2567,6 +2590,15 @@ namespace IDM_Toolkit_Wpf
                     catch { }
                 }
 
+                // 3. 同步解除 ACL 锁定并清理试用记录
+                try
+                {
+                    int unfreezeCount = TrialFreezeEngine.CleanAllTrialKeys(logFn);
+                    if (unfreezeCount > 0 && logFn != null)
+                        logFn("✓ 已同步解除 ACL 权限锁定并清理试用特征项 " + unfreezeCount + " 处");
+                }
+                catch { }
+
                 if (logFn != null)
                 {
                     logFn("✓ 注册表授权配置已彻底重置为【官方未注册原版】状态！");
@@ -2858,6 +2890,436 @@ namespace IDM_Toolkit_Wpf
 
     #endregion
 
+    #region 原生 ACL 试用期永久冻结引擎 (Trial Freeze & ACL Engine)
+
+    public static class TrialFreezeEngine
+    {
+        [DllImport("ntdll.dll", SetLastError = true)]
+        private static extern int RtlAdjustPrivilege(int privilege, bool enable, bool currentThread, out bool enabled);
+
+        private const int SE_TAKE_OWNERSHIP_PRIVILEGE = 9;
+        private const int SE_BACKUP_PRIVILEGE = 17;
+        private const int SE_RESTORE_PRIVILEGE = 18;
+
+        public static void EnableTokenPrivileges()
+        {
+            try
+            {
+                bool prev;
+                RtlAdjustPrivilege(SE_TAKE_OWNERSHIP_PRIVILEGE, true, false, out prev);
+                RtlAdjustPrivilege(SE_BACKUP_PRIVILEGE, true, false, out prev);
+                RtlAdjustPrivilege(SE_RESTORE_PRIVILEGE, true, false, out prev);
+            }
+            catch { }
+        }
+
+        private static readonly Regex GuidRegex = new Regex(
+            @"^\{[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12}\}$",
+            RegexOptions.IgnoreCase);
+
+        private static readonly string[] ExcludeSubKeys = new string[] {
+            "LocalServer32", "InProcServer32", "InProcHandler32"
+        };
+
+        private static readonly string[] IdmValueNames = new string[] {
+            "MData", "Model", "scansk", "Therad"
+        };
+
+        private static readonly SecurityIdentifier EveryoneSid = new SecurityIdentifier(WellKnownSidType.WorldSid, null);
+        private static readonly SecurityIdentifier AdminSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+
+        private const RegistryRights DenyRights = RegistryRights.SetValue | RegistryRights.CreateSubKey | RegistryRights.Delete | RegistryRights.WriteKey;
+
+        public static string[] GetClsidRoots()
+        {
+            if (Environment.Is64BitOperatingSystem)
+            {
+                return new string[] {
+                    @"Software\Classes\WOW6432Node\CLSID",
+                    @"Software\Classes\CLSID"
+                };
+            }
+            else
+            {
+                return new string[] {
+                    @"Software\Classes\CLSID"
+                };
+            }
+        }
+
+        public static bool IsIdmClsidKey(RegistryKey parentKey, string subName)
+        {
+            if (string.IsNullOrEmpty(subName) || !GuidRegex.IsMatch(subName))
+                return false;
+
+            bool isLocked = false;
+            try
+            {
+                using (RegistryKey testKey = parentKey.OpenSubKey(subName, false))
+                {
+                    if (testKey == null)
+                    {
+                        // 无法打开（已被 ACL 拒绝读取/写入），判定为锁定的试用项
+                        return true;
+                    }
+
+                    string[] subKeys = testKey.GetSubKeyNames();
+                    foreach (string exclude in ExcludeSubKeys)
+                    {
+                        if (Array.IndexOf(subKeys, exclude) >= 0)
+                            return false; // 排除标准 COM 系统组件
+                    }
+
+                    // 检查 DACL 中是否已有针对 Everyone 的 Deny 规则
+                    try
+                    {
+                        RegistrySecurity sec = testKey.GetAccessControl();
+                        AuthorizationRuleCollection rules = sec.GetAccessRules(true, true, typeof(SecurityIdentifier));
+                        foreach (RegistryAccessRule rule in rules)
+                        {
+                            if (rule.AccessControlType == AccessControlType.Deny)
+                            {
+                                isLocked = true;
+                                break;
+                            }
+                        }
+                    }
+                    catch { }
+
+                    if (isLocked) return true;
+
+                    // 规则 A: 默认值为纯数字且无子项
+                    object defVal = testKey.GetValue("");
+                    string sDef = defVal != null ? defVal.ToString() : null;
+                    if (sDef != null)
+                    {
+                        if (subKeys.Length == 0 && Regex.IsMatch(sDef, @"^\d+$"))
+                            return true;
+                        // 规则 B: 默认值含 '+' 或 '=' 且无子项
+                        if (subKeys.Length == 0 && (sDef.Contains("+") || sDef.Contains("=")))
+                            return true;
+                    }
+
+                    // 规则 C: 包含 Version 子项且其默认值为纯数字
+                    if (subKeys.Length == 1 && string.Equals(subKeys[0], "Version", StringComparison.OrdinalIgnoreCase))
+                    {
+                        using (RegistryKey verKey = testKey.OpenSubKey("Version", false))
+                        {
+                            if (verKey != null)
+                            {
+                                object verVal = verKey.GetValue("");
+                                if (verVal != null && Regex.IsMatch(verVal.ToString(), @"^\d+$"))
+                                    return true;
+                            }
+                        }
+                    }
+
+                    // 规则 D: 包含 MData/Model/scansk/Therad 特征值
+                    string[] valNames = testKey.GetValueNames();
+                    foreach (string vn in valNames)
+                    {
+                        foreach (string idmVn in IdmValueNames)
+                        {
+                            if (string.Equals(vn, idmVn, StringComparison.OrdinalIgnoreCase))
+                                return true;
+                        }
+                    }
+
+                    // 规则 E: 0 值且 0 子项的幽灵空键
+                    if (valNames.Length == 0 && subKeys.Length == 0)
+                        return true;
+                }
+            }
+            catch (SecurityException)
+            {
+                return true;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return true;
+            }
+            catch { }
+
+            return false;
+        }
+
+        public static bool LockKey(RegistryKey parentKey, string subName)
+        {
+            EnableTokenPrivileges();
+            try
+            {
+                UnlockKey(parentKey, subName);
+
+                using (RegistryKey key = parentKey.OpenSubKey(subName, RegistryKeyPermissionCheck.ReadWriteSubTree, RegistryRights.ChangePermissions | RegistryRights.ReadKey))
+                {
+                    if (key == null) return false;
+                    RegistrySecurity sec = key.GetAccessControl();
+                    sec.AddAccessRule(new RegistryAccessRule(
+                        EveryoneSid,
+                        DenyRights,
+                        InheritanceFlags.ContainerInherit,
+                        PropagationFlags.None,
+                        AccessControlType.Deny
+                    ));
+                    key.SetAccessControl(sec);
+                    return true;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static bool UnlockKey(RegistryKey parentKey, string subName)
+        {
+            EnableTokenPrivileges();
+            try
+            {
+                // 1. 尝试直接以 ChangePermissions 打开并移除 Deny 规则
+                try
+                {
+                    using (RegistryKey key = parentKey.OpenSubKey(subName, RegistryKeyPermissionCheck.ReadWriteSubTree, RegistryRights.ChangePermissions | RegistryRights.ReadKey))
+                    {
+                        if (key != null)
+                        {
+                            RegistrySecurity sec = key.GetAccessControl();
+                            sec.RemoveAccessRule(new RegistryAccessRule(
+                                EveryoneSid,
+                                DenyRights,
+                                InheritanceFlags.ContainerInherit,
+                                PropagationFlags.None,
+                                AccessControlType.Deny
+                            ));
+                            AuthorizationRuleCollection rules = sec.GetAccessRules(true, true, typeof(SecurityIdentifier));
+                            for (int i = rules.Count - 1; i >= 0; i--)
+                            {
+                                RegistryAccessRule r = rules[i] as RegistryAccessRule;
+                                if (r != null && r.AccessControlType == AccessControlType.Deny)
+                                {
+                                    sec.RemoveAccessRuleSpecific(r);
+                                }
+                            }
+                            key.SetAccessControl(sec);
+                            return true;
+                        }
+                    }
+                }
+                catch { }
+
+                // 2. 若直接打开被拒绝，尝试先获取所有权再重写 DACL
+                try
+                {
+                    using (RegistryKey key = parentKey.OpenSubKey(subName, RegistryKeyPermissionCheck.ReadWriteSubTree, RegistryRights.TakeOwnership))
+                    {
+                        if (key != null)
+                        {
+                            RegistrySecurity sec = new RegistrySecurity();
+                            sec.SetOwner(AdminSid);
+                            key.SetAccessControl(sec);
+                        }
+                    }
+                }
+                catch { }
+
+                try
+                {
+                    using (RegistryKey key = parentKey.OpenSubKey(subName, RegistryKeyPermissionCheck.ReadWriteSubTree, RegistryRights.ChangePermissions))
+                    {
+                        if (key != null)
+                        {
+                            RegistrySecurity sec = new RegistrySecurity();
+                            sec.ResetAccessRule(new RegistryAccessRule(
+                                EveryoneSid,
+                                RegistryRights.FullControl,
+                                InheritanceFlags.ContainerInherit,
+                                PropagationFlags.None,
+                                AccessControlType.Allow
+                            ));
+                            key.SetAccessControl(sec);
+                            return true;
+                        }
+                    }
+                }
+                catch { }
+            }
+            catch { }
+            return false;
+        }
+
+        public static void TriggerTrialInitialization(string idmDir, Action<string> logFn)
+        {
+            string idmExe = Path.Combine(idmDir, "IDMan.exe");
+            if (!File.Exists(idmExe)) return;
+
+            if (logFn != null) logFn("正在唤醒 IDM 初始化全新 30 天试用基线...");
+
+            string tempFile = Path.Combine(Path.GetTempPath(), "idm_trial_probe.png");
+            try { if (File.Exists(tempFile)) File.Delete(tempFile); } catch { }
+
+            bool probeSuccess = false;
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo();
+                psi.FileName = idmExe;
+                psi.Arguments = "/n /d \"https://www.internetdownloadmanager.com/images/idm_box_min.png\" /p \"" + Path.GetTempPath().TrimEnd('\\') + "\" /f idm_trial_probe.png";
+                psi.CreateNoWindow = true;
+                psi.UseShellExecute = false;
+
+                using (Process p = Process.Start(psi))
+                {
+                    for (int i = 0; i < 15; i++)
+                    {
+                        Thread.Sleep(200);
+                        if (File.Exists(tempFile))
+                        {
+                            probeSuccess = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            if (!probeSuccess)
+            {
+                try
+                {
+                    ProcessStartInfo psi = new ProcessStartInfo();
+                    psi.FileName = idmExe;
+                    psi.CreateNoWindow = true;
+                    psi.UseShellExecute = false;
+                    using (Process p = Process.Start(psi))
+                    {
+                        Thread.Sleep(1200);
+                    }
+                }
+                catch { }
+            }
+
+            try { if (File.Exists(tempFile)) File.Delete(tempFile); } catch { }
+            MainWindow.KillIDMDirect(null);
+            Thread.Sleep(300);
+        }
+
+        public static int CleanAllTrialKeys(Action<string> logFn)
+        {
+            EnableTokenPrivileges();
+            int cleanedCount = 0;
+            string[] clsidRoots = GetClsidRoots();
+
+            foreach (string rootPath in clsidRoots)
+            {
+                try
+                {
+                    using (RegistryKey clsidKey = Registry.CurrentUser.OpenSubKey(rootPath, true))
+                    {
+                        if (clsidKey == null) continue;
+                        string[] subKeyNames = clsidKey.GetSubKeyNames();
+                        foreach (string subName in subKeyNames)
+                        {
+                            if (IsIdmClsidKey(clsidKey, subName))
+                            {
+                                UnlockKey(clsidKey, subName);
+                                try
+                                {
+                                    clsidKey.DeleteSubKeyTree(subName, false);
+                                    cleanedCount++;
+                                    if (logFn != null) logFn("已解除锁定并清除旧试用特征项: " + subName);
+                                }
+                                catch { }
+                            }
+                        }
+                    }
+                }
+                catch { }
+            }
+            return cleanedCount;
+        }
+
+        public static int LockAllTrialKeys(Action<string> logFn)
+        {
+            EnableTokenPrivileges();
+            int lockedCount = 0;
+            string[] clsidRoots = GetClsidRoots();
+
+            foreach (string rootPath in clsidRoots)
+            {
+                try
+                {
+                    using (RegistryKey clsidKey = Registry.CurrentUser.OpenSubKey(rootPath, true))
+                    {
+                        if (clsidKey == null) continue;
+                        string[] subKeyNames = clsidKey.GetSubKeyNames();
+                        foreach (string subName in subKeyNames)
+                        {
+                            if (IsIdmClsidKey(clsidKey, subName))
+                            {
+                                if (LockKey(clsidKey, subName))
+                                {
+                                    lockedCount++;
+                                    if (logFn != null) logFn("✓ 已通过 ACL 权限锁定试用项: " + subName);
+                                }
+                            }
+                        }
+                    }
+                }
+                catch { }
+            }
+            return lockedCount;
+        }
+
+        public static bool IsTrialFrozen()
+        {
+            try
+            {
+                string[] clsidRoots = GetClsidRoots();
+                foreach (string rootPath in clsidRoots)
+                {
+                    using (RegistryKey clsidKey = Registry.CurrentUser.OpenSubKey(rootPath, false))
+                    {
+                        if (clsidKey == null) continue;
+                        string[] subKeyNames = clsidKey.GetSubKeyNames();
+                        foreach (string subName in subKeyNames)
+                        {
+                            if (GuidRegex.IsMatch(subName))
+                            {
+                                try
+                                {
+                                    using (RegistryKey testKey = clsidKey.OpenSubKey(subName, false))
+                                    {
+                                        if (testKey != null)
+                                        {
+                                            RegistrySecurity sec = testKey.GetAccessControl();
+                                            AuthorizationRuleCollection rules = sec.GetAccessRules(true, true, typeof(SecurityIdentifier));
+                                            foreach (RegistryAccessRule rule in rules)
+                                            {
+                                                if (rule.AccessControlType == AccessControlType.Deny)
+                                                    return true;
+                                            }
+                                        }
+                                    }
+                                }
+                                catch (SecurityException)
+                                {
+                                    return true;
+                                }
+                                catch (UnauthorizedAccessException)
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+    }
+
+    #endregion
+
         public static bool ExecutePatchDirect(Action<string> logFn, out int appliedCount)
         {
             return ExecutePatchDirect(logFn, out appliedCount, null);
@@ -2997,19 +3459,126 @@ namespace IDM_Toolkit_Wpf
         private void ExecuteTrialFreeze()
         {
             SwitchTab(2);
-            Log("================= 开始执行模式二：永久冻结试用期 =================");
-            KillIDM();
+            int lockedCount = 0;
+            bool ok = ExecuteTrialFreezeDirect(Log, out lockedCount);
+            RefreshAllStatus();
+
+            if (ok)
+            {
+                ModernDialog.ShowSuccess(this, "试用期冻结成功",
+                    "IDM 试用期已成功永久冻结！\n\n" +
+                    "• 已通过 Windows ACL 权限锁定 " + lockedCount + " 处试用策略键\n" +
+                    "• 试用状态：永久锁定在剩余 30 天，零弹窗骚扰\n" +
+                    "• 核心优势：完全未修改任何二进制，支持官方在线静默更新！\n\n" +
+                    "若后续需出厂重置或改用其他激活模式，可随时使用模式四或还原功能。");
+            }
+            else
+            {
+                ModernDialog.ShowWarning(this, "冻结提示",
+                    "未能成功锁定试用策略键，详情请查看控制台日志。\n\n" +
+                    "建议确保以管理员权限运行，并在退出安全防护软件拦截后重试。");
+            }
+        }
+
+        public static bool ExecuteTrialFreezeDirect(Action<string> logFn, out int lockedCount)
+        {
+            lockedCount = 0;
+            if (logFn != null) logFn("================= 开始执行模式二：一键永久冻结试用期 =================");
+
+            string idmDir = GetIDMDir();
+            string targetExe = Path.Combine(idmDir, "IDMan.exe");
+            if (!File.Exists(targetExe))
+            {
+                if (logFn != null) logFn("错误：未找到 IDMan.exe，请先确认 IDM 是否已安装。");
+                return false;
+            }
+
+            // 步骤 1: 终止后台进程
+            if (logFn != null) logFn("步骤 1/4: 正在安全终止后台运行的 IDM 监控与下载进程...");
+            KillIDMDirect(logFn);
+            Thread.Sleep(300);
+
+            // 步骤 2: 清理 DownloadManager 注册表中的追踪/黑名单/假序列号字段，并配置底层策略
+            if (logFn != null) logFn("步骤 2/4: 正在清理历史授权追踪与黑名单遥测项，同步底层驱动策略...");
             try
             {
-                Log("正在检索 Windows Classes CLSID 时间策略键...");
-                Thread.Sleep(200);
-                Log("已通过系统 ACL 特权锁定试用时间戳为永久剩余 30 天。");
-                Log("✓ 试用期冻结生效！完全支持 IDM 官方无缝在线静默更新。");
-                RefreshAllStatus();
+                using (RegistryKey k = Registry.CurrentUser.CreateSubKey(@"Software\DownloadManager"))
+                {
+                    if (k != null)
+                    {
+                        string[] cleanList = new string[] {
+                            "FName", "LName", "Email", "Serial", "scansk", "tvfrdt",
+                            "radxcnt", "LstCheck", "ptrk_scdt", "LastCheckQU",
+                            "scTime", "NextCheck", "BList", "md5pks", "itb_r", "ncl_r"
+                        };
+                        foreach (string field in cleanList)
+                        {
+                            try { k.DeleteValue(field, false); } catch { }
+                        }
+                        k.SetValue("CheckUpdtVM", 0, RegistryValueKind.DWord);
+                        k.SetValue("LstCheck", "0", RegistryValueKind.String);
+                    }
+                }
+
+                // HKLM 驱动策略
+                string hklmPath = Environment.Is64BitOperatingSystem
+                    ? @"SOFTWARE\Wow6432Node\Internet Download Manager"
+                    : @"SOFTWARE\Internet Download Manager";
+                try
+                {
+                    using (RegistryKey hk = Registry.LocalMachine.CreateSubKey(hklmPath))
+                    {
+                        if (hk != null)
+                        {
+                            hk.SetValue("AdvIntDriverEnabled2", 1, RegistryValueKind.DWord);
+                        }
+                    }
+                }
+                catch { }
             }
             catch (Exception ex)
             {
-                Log("冻结失败: " + ex.Message);
+                if (logFn != null) logFn("清理追踪项提示: " + ex.Message);
+            }
+
+            // 解除并清理现存旧的/过期的 CLSID 试用键
+            int cleaned = TrialFreezeEngine.CleanAllTrialKeys(logFn);
+            if (logFn != null) logFn("✓ 已清理旧试用与过期特征项共 " + cleaned + " 处");
+
+            // 步骤 3: 触发 IDM 生成全新 30 天试用基线
+            if (logFn != null) logFn("步骤 3/4: 触发 IDM 引擎初始化全新 30 天官方评估基线...");
+            TrialFreezeEngine.TriggerTrialInitialization(idmDir, logFn);
+
+            // 步骤 4: 扫描并锁定全新生成的 CLSID 试用时间策略键
+            if (logFn != null) logFn("步骤 4/4: 正在通过 Windows ACL 权限机制锁定试用策略键...");
+            lockedCount = TrialFreezeEngine.LockAllTrialKeys(logFn);
+
+            if (lockedCount > 0)
+            {
+                if (logFn != null)
+                {
+                    logFn("★ 永久冻结试用期成功！共锁定 " + lockedCount + " 处核心 CLSID 试用时间策略键。");
+                    logFn("✓ 运行状态：试用倒计时永久停留在剩余 30 天，无任何弹窗骚扰。");
+                    logFn("✓ 升级兼容：未修改任何二进制文件，完全兼容 IDM 官方无缝在线静默更新！");
+                }
+                return true;
+            }
+            else
+            {
+                if (logFn != null)
+                {
+                    logFn("⚠ 提示：未检测到新生成的 CLSID 试用键，正在重试深度扫描...");
+                }
+                // 再次短暂启动 IDM 并扫描
+                TrialFreezeEngine.TriggerTrialInitialization(idmDir, null);
+                lockedCount = TrialFreezeEngine.LockAllTrialKeys(logFn);
+                if (lockedCount > 0)
+                {
+                    if (logFn != null) logFn("★ 重试锁定成功！共锁定 " + lockedCount + " 处试用策略键。");
+                    return true;
+                }
+                if (logFn != null) logFn("警告：未能锁定 CLSID 试用键，建议先手动打开一次 IDM 再执行冻结。");
+                return false;
             }
         }
 
@@ -3163,54 +3732,10 @@ namespace IDM_Toolkit_Wpf
                 }
 
                 // 2. 清理 CLSID 下包含时间戳/锁定的隐藏 GUID 项
-                int deletedGuids = 0;
-                string[] clsidRoots = { @"Software\Classes\CLSID", @"Software\Classes\WOW6432Node\CLSID" };
-                Regex guidRegex = new Regex(@"^\{[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12}\}$", RegexOptions.IgnoreCase);
-
-                foreach (string rootPath in clsidRoots)
-                {
-                    try
-                    {
-                        using (RegistryKey clsidKey = Registry.CurrentUser.OpenSubKey(rootPath, true))
-                        {
-                            if (clsidKey == null) continue;
-
-                            string[] subKeyNames = clsidKey.GetSubKeyNames();
-                            foreach (string subName in subKeyNames)
-                            {
-                                if (guidRegex.IsMatch(subName))
-                                {
-                                    try
-                                    {
-                                        using (RegistryKey testKey = clsidKey.OpenSubKey(subName))
-                                        {
-                                            if (testKey != null)
-                                            {
-                                                object defVal = testKey.GetValue("");
-                                                if (defVal != null)
-                                                {
-                                                    string sVal = defVal.ToString();
-                                                    // 检查是否为纯数字或带 +/= 试用时间特征
-                                                    if (Regex.IsMatch(sVal, @"^\d+$") || sVal.Contains("+") || sVal.Contains("="))
-                                                    {
-                                                        clsidKey.DeleteSubKeyTree(subName, false);
-                                                        deletedGuids++;
-                                                        Log("已清除 CLSID 试用锁定项: " + subName);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    catch { }
-                                }
-                            }
-                        }
-                    }
-                    catch { }
-                }
+                int deletedGuids = TrialFreezeEngine.CleanAllTrialKeys(Log);
 
                 Log("✓ 第一阶段：已抹除 DownloadManager 配置关联项 " + deletedProps + " 处");
-                Log("✓ 第二阶段：已清理 CLSID 试用与锁定特征项 " + deletedGuids + " 处");
+                Log("✓ 第二阶段：已解除锁定并清理 CLSID 试用策略项 " + deletedGuids + " 处");
                 Log("✓ 模式四执行完毕：IDM 授权与黑名单数据已彻底消除，成功恢复出厂纯净状态！");
 
                 RefreshAllStatus();
